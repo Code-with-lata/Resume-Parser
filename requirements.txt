@@ -1,0 +1,7 @@
+streamlit
+requests
+python-dotenv
+pdfplumber
+docx2txt
+pydantic
+typing_extensions
