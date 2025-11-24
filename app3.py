@@ -7,20 +7,17 @@ import requests
 import pdfplumber
 import docx2txt
 import streamlit as st
-from typing import List
+from typing import List, Dict, Any
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # ---------------- CONFIG ----------------
-# LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://127.0.0.1:1234/v1/chat/completions")
-LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "https://dispensatorily-jettisonable-johnson.ngrok-free.dev/v1/chat/completions")
+LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://localhost:1234/v1/chat/completions")
 HEADERS = {"Content-Type": "application/json"}
-# if os.getenv("LM_STUDIO_API_KEY"):
-#     HEADERS["Authorization"] = f"Bearer {os.getenv('LM_STUDIO_API_KEY')}"
-MODEL_NAME = os.getenv("LM_STUDIO_MODEL", "qwen3-4b-instruct-2507")
+MODEL_NAME = os.getenv("LM_STUDIO_MODEL", "qwen2.5-3b-instruct")
 
-# ---------------- HELPERS -----------
+# ---------------- HELPERS ----------------
 def extract_text_from_file(file) -> str:
     name = file.name.lower()
     data = file.read()
@@ -138,12 +135,13 @@ EXAMPLE:
 --- CANDIDATE:
 {resumes_block}
 
+
 **BEGIN JSON OUTPUT NOW:**
 """
     return prompt.strip()
 
 # ---------------- LM STUDIO CALL ----------------
-def call_lm_studio_inference(prompt: str, max_new_tokens: int = 4096, timeout: int = 300):
+def call_lm_studio_inference(prompt: str, max_new_tokens: int = 4096, timeout: int = 120):
     if not LM_STUDIO_URL:
         raise RuntimeError("LM_STUDIO_URL not set.")
     payload = {
@@ -299,6 +297,46 @@ def validate_and_fix(merged: dict, candidate_names: List[str]) -> dict:
     merged["hiring_insights"] = list(dict.fromkeys(merged.get("hiring_insights", [])))
     return merged
 
+# ---------------- JD skill extraction + fallback scoring ----------------
+def extract_jd_skills(jd_text: str, max_skills: int = 7):
+    if not jd_text:
+        return []
+    parts = re.split(r"[\n\-•]|,|;|:|/|\(|\)", jd_text)
+    tokens = []
+    for p in parts:
+        t = p.strip()
+        if len(t) <= 2:
+            continue
+        t = re.sub(r"(?i)^(must have|required|should have|experience in|experience with|responsibilities|skills)\s*", "", t).strip()
+        t = re.split(r"\bwith\b|\bincluding\b|\bexperience\b", t, flags=re.IGNORECASE)[0].strip()
+        if len(t) > 2:
+            tokens.append(t)
+    seen = set(); out=[]
+    for tk in tokens:
+        key = tk.lower()
+        if key not in seen:
+            seen.add(key); out.append(tk)
+        if len(out) >= max_skills:
+            break
+    return out
+
+def compute_fallback_scores(jd_skills: List[str], resume_texts: Dict[str, str]):
+    scores = {}
+    skill_matches = {s: [] for s in jd_skills}
+    for name, txt in resume_texts.items():
+        text = (txt or "").lower()
+        match_count = 0
+        for s in jd_skills:
+            if not s:
+                continue
+            if s.lower() in text:
+                skill_matches.setdefault(s, []).append(name)
+                match_count += 1
+        frac = match_count / max(1, len(jd_skills))
+        scores[name] = (match_count, round(frac, 2))
+    return scores, skill_matches
+
+
 # ---------------- STREAMLIT UI ----------------
 st.set_page_config(page_title="Resume Parser (LM Studio Local )", layout="wide")
 st.title("📄 Resume Parser — LM Studio Local Server")
@@ -319,7 +357,7 @@ if resume_texts:
 else:
     st.write("No resumes uploaded yet.")
 
-if st.button("Analyze with LM Studio Model"):
+if st.button("🚀 Analyze (single-call shortlist)"):
     if not job_description.strip():
         st.error("Please provide a Job Description for JD-aligned matching.")
     elif not resume_texts:
@@ -328,7 +366,7 @@ if st.button("Analyze with LM Studio Model"):
         with st.spinner("Calling LM Studio with all candidates... this may take a little while"):
             prompt_all = build_prompt_for_candidate(job_description, resume_texts, threshold=threshold)
             try:
-                raw = call_lm_studio_inference(prompt_all, max_new_tokens=4096, timeout=300)
+                raw = call_lm_studio_inference(prompt_all, max_new_tokens=4096, timeout=180)
             except Exception as e:
                 st.error(f"LM Studio call failed: {e}")
                 raw = None
@@ -347,7 +385,30 @@ if st.button("Analyze with LM Studio Model"):
             parsed.setdefault("match_scores", {})
             parsed.setdefault("shortlist", [])
 
+            if parsed.get("skill_matches"):
+                jd_skills = list(parsed["skill_matches"].keys())[:7]
+            else:
+                jd_skills = extract_jd_skills(job_description, max_skills=7)
+
+            # compute fallback substring scores and skill mapping
+            fallback_scores, fallback_skill_matches = compute_fallback_scores(jd_skills, resume_texts)
+
+
             merged = merge_results([parsed])
+
+            if not merged.get("skill_matches"):
+                merged["skill_matches"] = fallback_skill_matches
+            else:
+                for s, names in fallback_skill_matches.items():
+                    merged["skill_matches"].setdefault(s, [])
+                    for n in names:
+                        if n not in merged["skill_matches"][s]:
+                            merged["skill_matches"][s].append(n)
+
+            # prefer model-provided numeric match_scores; otherwise set fallback scores
+            for name, (cnt, frac) in fallback_scores.items():
+                if name not in merged.get("match_scores", {}):
+                    merged.setdefault("match_scores", {})[name] = float(frac)
 
             scores = compute_skill_scores_from_merged(merged)
 
@@ -374,19 +435,19 @@ if st.button("Analyze with LM Studio Model"):
                         else:
                             rank = "Low"
                         merged["candidate_rankings"].append(f"{name}: {rank} - (auto-assigned)")
-
+        
             st.success("✅ Analysis complete")
-            st.subheader(" Model-produced / merged JSON")
+            st.subheader("🔍 Model-produced / merged JSON")
             st.json(merged)
 
-            st.subheader(" Final Shortlist (threshold-based)")
+            st.subheader("🎯 Final Shortlist (threshold-based)")
             st.write(f"Threshold = {threshold}")
             st.write(final_shortlist)
 
-            st.subheader(" Scores (match_count, fraction)")
+            st.subheader("🔢 Scores (match_count, fraction)")
             st.write(scores)
 
-            st.subheader(" Quick field checks")
+            st.subheader("ℹ️ Quick field checks")
             for name, txt in resume_texts.items():
                 em, ph = simple_regex_extract(txt)
                 st.write(f"- {name}: email={em} | phone={ph}")
