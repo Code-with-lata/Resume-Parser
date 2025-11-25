@@ -14,7 +14,7 @@ load_dotenv()
 
 # ---------------- CONFIG ----------------
 # LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://127.0.0.1:1234/v1/chat/completions")
-LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "https://dispensatorily-jettisonable-johnson.ngrok-free.dev/v1/chat/completions")
+LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", " https://dispensatorily-jettisonable-johnson.ngrok-free.dev/v1/chat/completions")
 HEADERS = {"Content-Type": "application/json"}
 # if os.getenv("LM_STUDIO_API_KEY"):
 #     HEADERS["Authorization"] = f"Bearer {os.getenv('LM_STUDIO_API_KEY')}"
